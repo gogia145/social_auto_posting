@@ -234,7 +234,7 @@ def main():
         if DRY_RUN:
             print("DRY_RUN=true; not publishing.")
             continue
-        result = publish_facebook(caption)
+        result = publish_facebook(item, caption)
         print(f"Published Facebook post ID: {result.get('id', 'unknown')}")
         newly_posted.add(key)
         posted_count += 1
