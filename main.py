@@ -43,70 +43,167 @@ def save_state(ids):
     with open(STATE_FILE, "w", encoding="utf-8") as f:
         json.dump(sorted(ids), f, ensure_ascii=False, indent=2)
 
+
 def fetch_feed(url):
     try:
         response = requests.get(url, headers=HEADERS, timeout=TIMEOUT)
         response.raise_for_status()
         root = ET.fromstring(response.content)
         items = []
-        # RSS 2.0
+
+        media_ns = {
+            "media": "http://search.yahoo.com/mrss/",
+            "atom": "http://www.w3.org/2005/Atom",
+        }
+
         for node in root.findall(".//item"):
             title = clean_text(node.findtext("title"))
             link = clean_text(node.findtext("link"))
-            desc = clean_text(node.findtext("description"))
-            pubdate = clean_text(node.findtext("pubDate"))
+            summary = clean_text(node.findtext("description"))
+            published = clean_text(node.findtext("pubDate"))
+
+            image_url = ""
+            video_url = ""
+
+            # Standard RSS enclosure
+            enclosure = node.find("enclosure")
+            if enclosure is not None:
+                media_url = enclosure.attrib.get("url", "")
+                media_type = enclosure.attrib.get("type", "").lower()
+                if media_type.startswith("image/"):
+                    image_url = media_url
+                elif media_type.startswith("video/"):
+                    video_url = media_url
+
+            # Media RSS image/video
+            for media in node.findall("media:content", media_ns):
+                media_url = media.attrib.get("url", "")
+                media_type = media.attrib.get("type", "").lower()
+                if media_type.startswith("image/") and not image_url:
+                    image_url = media_url
+                elif media_type.startswith("video/") and not video_url:
+                    video_url = media_url
+
+            thumbnail = node.find("media:thumbnail", media_ns)
+            if thumbnail is not None and not image_url:
+                image_url = thumbnail.attrib.get("url", "")
+
             if title and link:
-                items.append({"title": title, "link": link, "summary": desc, "published": pubdate, "feed": url})
-        # Atom fallback
-        if not items:
-            ns = {"atom": "http://www.w3.org/2005/Atom"}
-            for node in root.findall(".//atom:entry", ns):
-                title = clean_text(node.findtext("atom:title", default="", namespaces=ns))
-                summary = clean_text(node.findtext("atom:summary", default="", namespaces=ns))
-                link_node = node.find("atom:link", ns)
-                link = link_node.attrib.get("href", "") if link_node is not None else ""
-                published = clean_text(node.findtext("atom:updated", default="", namespaces=ns))
-                if title and link:
-                    items.append({"title": title, "link": link, "summary": summary, "published": published, "feed": url})
+                items.append({
+                    "title": title,
+                    "link": link,
+                    "summary": summary,
+                    "published": published,
+                    "feed": url,
+                    "image_url": image_url,
+                    "video_url": video_url,
+                })
+
         return items
+
     except Exception as exc:
         print(f"Feed unavailable: {url} ({exc})")
         return []
 
+
 def item_id(item):
     return hashlib.sha256((item["link"] or item["title"]).encode("utf-8")).hexdigest()
 
-def make_original_caption(item):
-    """
-    Basic no-AI rewrite: uses a headline as a short attributed summary prompt.
-    This intentionally does not copy the article body or images.
-    It is a starter template, not a guarantee of copyright clearance or factual verification.
-    """
-    title = item["title"].strip().rstrip(".")
-    domain = urlparse(item["link"]).netloc.replace("www.", "")
-    summary = item.get("summary", "")
-    # Keep any source summary very short; RSS descriptions may contain publisher-owned text.
-    # Prefer a question/commentary caption based on the headline alone.
-    if len(title) > 180:
-        title = title[:177].rsplit(" ", 1)[0] + "..."
-    return (
-        f"📰 What do you think about this development?\n\n"
-        f"{title}\n\n"
-        f"Read the full report from {domain}: {item['link']}\n\n"
-        f"💬 Share your thoughts in the comments."
-    )
 
-def publish_facebook(message):
+def make_original_caption(item):
+    title = item["title"].strip().rstrip(".")
+    summary = clean_text(item.get("summary", ""))
+    domain = urlparse(item["link"]).netloc.replace("www.", "")
+
+    # RSS summary ko short rakhein; article ko word-for-word copy na karein.
+    if len(summary) > 500:
+        summary = summary[:497].rsplit(" ", 1)[0] + "..."
+
+    parts = [
+        f"📰 {title}",
+        "",
+    ]
+
+    if summary:
+        parts.extend([
+            "Kya hua?",
+            summary,
+            "",
+        ])
+
+    parts.extend([
+        "Is update ka aage kya impact ho sakta hai? "
+        "Aapki kya rai hai? Comments mein batayein.",
+        "",
+        f"🔎 Source: {domain}",
+        item["link"],
+        "",
+        "#TrendingNews #LatestUpdates #Hinglish",
+    ])
+
+    return "\n".join(parts)
+
+
+def publish_facebook(item, message):
     if not FB_PAGE_ID or not FB_PAGE_TOKEN:
-        raise RuntimeError("Set FACEBOOK_PAGE_ID and FACEBOOK_PAGE_ACCESS_TOKEN as GitHub Actions secrets.")
-    endpoint = f"https://graph.facebook.com/{GRAPH_VERSION}/{FB_PAGE_ID}/feed"
-    response = requests.post(
-        endpoint,
-        data={"message": message, "access_token": FB_PAGE_TOKEN},
-        timeout=TIMEOUT,
-    )
+        raise RuntimeError(
+            "FACEBOOK_PAGE_ID aur FACEBOOK_PAGE_ACCESS_TOKEN "
+            "GitHub Secrets mein set karein."
+        )
+
+    base = f"https://graph.facebook.com/{GRAPH_VERSION}"
+    image_url = item.get("image_url", "")
+    video_url = item.get("video_url", "")
+
+    # Direct video file only; embedded YouTube/article pages are not files.
+    if video_url.lower().split("?")[0].endswith((".mp4", ".mov", ".m4v")):
+        response = requests.post(
+            f"{base}/{FB_PAGE_ID}/videos",
+            data={
+                "file_url": video_url,
+                "description": message,
+                "access_token": FB_PAGE_TOKEN,
+            },
+            timeout=90,
+        )
+
+    elif image_url.startswith("https://"):
+        response = requests.post(
+            f"{base}/{FB_PAGE_ID}/photos",
+            data={
+                "url": image_url,
+                "caption": message,
+                "access_token": FB_PAGE_TOKEN,
+            },
+            timeout=60,
+        )
+
+    else:
+        response = requests.post(
+            f"{base}/{FB_PAGE_ID}/feed",
+            data={
+                "message": message,
+                "access_token": FB_PAGE_TOKEN,
+            },
+            timeout=60,
+        )
+
     if not response.ok:
-        raise RuntimeError(f"Facebook API error {response.status_code}: {response.text[:800]}")
+        # Token ko kabhi logs mein print na karein.
+        try:
+            error = response.json().get("error", {})
+            safe_error = {
+                "message": error.get("message", "Unknown Facebook API error"),
+                "code": error.get("code"),
+                "type": error.get("type"),
+            }
+        except ValueError:
+            safe_error = {"message": "Unrecognized Facebook API response"}
+
+        raise RuntimeError(
+            f"Facebook API error {response.status_code}: {safe_error}"
+        )
+
     return response.json()
 
 def main():
