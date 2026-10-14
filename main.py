@@ -1,3 +1,4 @@
+
 import os
 import re
 import json
@@ -10,11 +11,19 @@ import xml.etree.ElementTree as ET
 import requests
 
 STATE_FILE = "posted_items.json"
-MAX_POSTS = int(os.getenv("MAX_POSTS_PER_RUN", "3"))
+MAX_POSTS = max(1, int(os.getenv("MAX_POSTS_PER_RUN", "3")))
 DRY_RUN = os.getenv("DRY_RUN", "true").lower() == "true"
+
 FB_PAGE_ID = os.getenv("FACEBOOK_PAGE_ID", "").strip()
+
+# Preferred: a valid long-lived User Access Token.
+# Fallback: the existing Page Access Token secret.
+FB_USER_TOKEN = os.getenv("FB_USER_ACCESS_TOKEN", "").strip()
 FB_PAGE_TOKEN = os.getenv("FACEBOOK_PAGE_ACCESS_TOKEN", "").strip()
+
 GRAPH_VERSION = os.getenv("META_GRAPH_API_VERSION", "v26.0")
+GRAPH_BASE = f"https://graph.facebook.com/{GRAPH_VERSION}"
+
 RSS_FEEDS = [
     "https://feeds.bbci.co.uk/news/rss.xml",
     "https://feeds.bbci.co.uk/news/technology/rss.xml",
@@ -23,13 +32,20 @@ RSS_FEEDS = [
     "https://techcrunch.com/feed/",
 ]
 
-HEADERS = {"User-Agent": "FreeTrendingPublisher/1.0 (RSS reader; contact site owner before high-volume use)"}
+HEADERS = {
+    "User-Agent": (
+        "FreeTrendingPublisher/1.0 "
+        "(RSS reader; contact site owner before high-volume use)"
+    )
+}
 TIMEOUT = 20
+
 
 def clean_text(value):
     value = html.unescape(value or "")
     value = re.sub(r"<[^>]+>", " ", value)
     return re.sub(r"\s+", " ", value).strip()
+
 
 def load_state():
     try:
@@ -39,14 +55,103 @@ def load_state():
     except (FileNotFoundError, json.JSONDecodeError):
         return set()
 
+
 def save_state(ids):
     with open(STATE_FILE, "w", encoding="utf-8") as f:
         json.dump(sorted(ids), f, ensure_ascii=False, indent=2)
 
 
+def api_error(response):
+    """Return safe error details without exposing access tokens."""
+    try:
+        error = response.json().get("error", {})
+        return {
+            "message": error.get("message", "Unknown Facebook API error"),
+            "code": error.get("code"),
+            "type": error.get("type"),
+            "is_transient": error.get("is_transient", False),
+        }
+    except (ValueError, AttributeError):
+        return {"message": "Unrecognized Facebook API response"}
+
+
+def get_page_access_token():
+    """
+    Obtain the target Page token dynamically using a valid User token.
+    Fall back to a configured Page token for backward compatibility.
+    """
+    if not FB_PAGE_ID:
+        raise RuntimeError("Missing FACEBOOK_PAGE_ID GitHub Secret.")
+
+    if not FB_USER_TOKEN:
+        if FB_PAGE_TOKEN:
+            return FB_PAGE_TOKEN
+
+        raise RuntimeError(
+            "Missing FB_USER_ACCESS_TOKEN. Add a valid long-lived "
+            "User Access Token to GitHub Actions Secrets."
+        )
+
+    url = f"{GRAPH_BASE}/me/accounts"
+    params = {
+        "fields": "id,name,access_token",
+        "limit": 100,
+        "access_token": FB_USER_TOKEN,
+    }
+
+    try:
+        while url:
+            response = requests.get(
+                url, params=params, timeout=TIMEOUT
+            )
+
+            if not response.ok:
+                error = api_error(response)
+
+                if error.get("code") == 190:
+                    raise RuntimeError(
+                        "Facebook User Access Token is expired or invalid. "
+                        "Generate a valid token and update FB_USER_ACCESS_TOKEN."
+                    )
+
+                raise RuntimeError(
+                    f"Facebook Page-token lookup failed: {error}"
+                )
+
+            data = response.json()
+
+            for page in data.get("data", []):
+                if str(page.get("id")) == str(FB_PAGE_ID):
+                    token = page.get("access_token")
+                    if token:
+                        return token
+
+                    raise RuntimeError(
+                        "Facebook returned the target Page without a token. "
+                        "Check Page access and permissions."
+                    )
+
+            # Follow pagination without printing URLs or tokens.
+            url = data.get("paging", {}).get("next")
+            params = None
+
+    except requests.RequestException as exc:
+        raise RuntimeError(
+            f"Could not retrieve Facebook Page token: "
+            f"{type(exc).__name__}"
+        ) from None
+
+    raise RuntimeError(
+        "Target Facebook Page was not found in /me/accounts. "
+        "Check FACEBOOK_PAGE_ID, Page access, and permissions."
+    )
+
+
 def fetch_feed(url):
     try:
-        response = requests.get(url, headers=HEADERS, timeout=TIMEOUT)
+        response = requests.get(
+            url, headers=HEADERS, timeout=TIMEOUT
+        )
         response.raise_for_status()
         root = ET.fromstring(response.content)
         items = []
@@ -65,20 +170,20 @@ def fetch_feed(url):
             image_url = ""
             video_url = ""
 
-            # Standard RSS enclosure
             enclosure = node.find("enclosure")
             if enclosure is not None:
                 media_url = enclosure.attrib.get("url", "")
                 media_type = enclosure.attrib.get("type", "").lower()
+
                 if media_type.startswith("image/"):
                     image_url = media_url
                 elif media_type.startswith("video/"):
                     video_url = media_url
 
-            # Media RSS image/video
             for media in node.findall("media:content", media_ns):
                 media_url = media.attrib.get("url", "")
                 media_type = media.attrib.get("type", "").lower()
+
                 if media_type.startswith("image/") and not image_url:
                     image_url = media_url
                 elif media_type.startswith("video/") and not video_url:
@@ -102,12 +207,14 @@ def fetch_feed(url):
         return items
 
     except Exception as exc:
-        print(f"Feed unavailable: {url} ({exc})")
+        print(f"Feed unavailable: {url} ({type(exc).__name__})")
         return []
 
 
 def item_id(item):
-    return hashlib.sha256((item["link"] or item["title"]).encode("utf-8")).hexdigest()
+    return hashlib.sha256(
+        (item["link"] or item["title"]).encode("utf-8")
+    ).hexdigest()
 
 
 def make_original_caption(item):
@@ -115,21 +222,13 @@ def make_original_caption(item):
     summary = clean_text(item.get("summary", ""))
     domain = urlparse(item["link"]).netloc.replace("www.", "")
 
-    # RSS summary ko short rakhein; article ko word-for-word copy na karein.
     if len(summary) > 500:
         summary = summary[:497].rsplit(" ", 1)[0] + "..."
 
-    parts = [
-        f"📰 {title}",
-        "",
-    ]
+    parts = [f"📰 {title}", ""]
 
     if summary:
-        parts.extend([
-            "Kya hua?",
-            summary,
-            "",
-        ])
+        parts.extend(["Kya hua?", summary, ""])
 
     parts.extend([
         "Is update ka aage kya impact ho sakta hai? "
@@ -145,75 +244,82 @@ def make_original_caption(item):
 
 
 def publish_facebook(item, message):
-    if not FB_PAGE_ID or not FB_PAGE_TOKEN:
-        raise RuntimeError(
-            "FACEBOOK_PAGE_ID aur FACEBOOK_PAGE_ACCESS_TOKEN "
-            "GitHub Secrets mein set karein."
-        )
+    if not FB_PAGE_ID:
+        raise RuntimeError("Missing FACEBOOK_PAGE_ID GitHub Secret.")
 
-    base = f"https://graph.facebook.com/{GRAPH_VERSION}"
+    # Resolve a Page token immediately before publishing.
+    page_token = get_page_access_token()
+
     image_url = item.get("image_url", "")
     video_url = item.get("video_url", "")
 
-    # Direct video file only; embedded YouTube/article pages are not files.
-    if video_url.lower().split("?")[0].endswith((".mp4", ".mov", ".m4v")):
-        response = requests.post(
-            f"{base}/{FB_PAGE_ID}/videos",
-            data={
-                "file_url": video_url,
-                "description": message,
-                "access_token": FB_PAGE_TOKEN,
-            },
-            timeout=90,
-        )
+    if video_url.lower().split("?")[0].endswith(
+        (".mp4", ".mov", ".m4v")
+    ):
+        endpoint = f"{GRAPH_BASE}/{FB_PAGE_ID}/videos"
+        payload = {
+            "file_url": video_url,
+            "description": message,
+            "access_token": page_token,
+        }
+        timeout = 90
 
     elif image_url.startswith("https://"):
-        response = requests.post(
-            f"{base}/{FB_PAGE_ID}/photos",
-            data={
-                "url": image_url,
-                "caption": message,
-                "access_token": FB_PAGE_TOKEN,
-            },
-            timeout=60,
-        )
+        endpoint = f"{GRAPH_BASE}/{FB_PAGE_ID}/photos"
+        payload = {
+            "url": image_url,
+            "caption": message,
+            "access_token": page_token,
+        }
+        timeout = 60
 
     else:
+        endpoint = f"{GRAPH_BASE}/{FB_PAGE_ID}/feed"
+        payload = {
+            "message": message,
+            "access_token": page_token,
+        }
+        timeout = 60
+
+    try:
         response = requests.post(
-            f"{base}/{FB_PAGE_ID}/feed",
-            data={
-                "message": message,
-                "access_token": FB_PAGE_TOKEN,
-            },
-            timeout=60,
+            endpoint, data=payload, timeout=timeout
         )
+    except requests.RequestException as exc:
+        raise RuntimeError(
+            f"Facebook publishing request failed: "
+            f"{type(exc).__name__}. Verify post status before retrying."
+        ) from None
 
     if not response.ok:
-        # Token ko kabhi logs mein print na karein.
-        try:
-            error = response.json().get("error", {})
-            safe_error = {
-                "message": error.get("message", "Unknown Facebook API error"),
-                "code": error.get("code"),
-                "type": error.get("type"),
-            }
-        except ValueError:
-            safe_error = {"message": "Unrecognized Facebook API response"}
+        error = api_error(response)
+
+        if error.get("code") == 190:
+            raise RuntimeError(
+                "Facebook authentication failed (code 190). "
+                "Check FB_USER_ACCESS_TOKEN and Page permissions. "
+                "Re-authentication may be required."
+            )
 
         raise RuntimeError(
-            f"Facebook API error {response.status_code}: {safe_error}"
+            f"Facebook API error {response.status_code}: {error}"
         )
 
     return response.json()
 
+
 def main():
-    print(f"Run started at {datetime.now(timezone.utc).isoformat()}")
+    print(
+        f"Run started at {datetime.now(timezone.utc).isoformat()}"
+    )
+    print(f"DRY_RUN={DRY_RUN}; MAX_POSTS={MAX_POSTS}")
+
     seen = load_state()
     items = []
+
     for feed in RSS_FEEDS:
         items.extend(fetch_feed(feed))
 
-    # Deduplicate and prefer fresh RSS items when feeds provide dates.
     unique = {}
     for item in items:
         key = item_id(item)
@@ -221,27 +327,50 @@ def main():
             unique.setdefault(key, item)
 
     candidates = list(unique.items())[:MAX_POSTS]
+
     if not candidates:
         print("No new RSS items to post.")
         return
 
     newly_posted = set(seen)
     posted_count = 0
+
     for key, item in candidates:
         caption = make_original_caption(item)
+
         print("\n--- Candidate ---")
         print(caption)
+
         if DRY_RUN:
             print("DRY_RUN=true; not publishing.")
             continue
-        result = publish_facebook(item, caption)
-        print(f"Published Facebook post ID: {result.get('id', 'unknown')}")
+
+        try:
+            result = publish_facebook(item, caption)
+        except RuntimeError as exc:
+            print(f"Publishing stopped: {exc}")
+            # Do not mark failed items as posted.
+            # Avoid further attempts with a broken token.
+            break
+
+        post_id = (
+            result.get("post_id")
+            or result.get("id")
+            or "unknown"
+        )
+        print(f"Published Facebook post ID: {post_id}")
+
         newly_posted.add(key)
         posted_count += 1
 
     if not DRY_RUN and posted_count:
         save_state(newly_posted)
-    print(f"Finished. Published {posted_count} post(s). DRY_RUN={DRY_RUN}")
+
+    print(
+        f"Finished. Published {posted_count} post(s). "
+        f"DRY_RUN={DRY_RUN}"
+    )
+
 
 if __name__ == "__main__":
     main()
