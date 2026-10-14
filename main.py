@@ -339,7 +339,28 @@ def add_facebook_comment(post_id, message, page_token):
         print(f"Auto-comment failed: {exc}")
         return False
 
+def validate_page_token(page_token):
+    response = session.get(
+        f"{GRAPH_BASE}/{FB_PAGE_ID}",
+        params={
+            "fields": "id,name",
+            "access_token": page_token,
+        },
+        timeout=TIMEOUT,
+    )
 
+    if not response.ok:
+        raise RuntimeError(
+            f"Page token validation failed: {api_error(response)}"
+        )
+
+    page = response.json()
+
+    if str(page.get("id")) != FB_PAGE_ID:
+        raise RuntimeError("Token does not match the configured Page.")
+
+    print(f"Page token validated for Page: {page.get('name')}")
+    
 # ------------ Main program ------------
 def main():
     print(
@@ -370,6 +391,7 @@ def main():
         return
 
     page_token = get_page_access_token()
+    validate_page_token(page_token)
 
     for item in selected:
         try:
