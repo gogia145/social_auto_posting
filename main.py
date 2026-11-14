@@ -4,7 +4,8 @@ import re
 import json
 import html
 import hashlib
-from datetime import datetime, timezone
+from datetime import datetime, timezone, timedelta
+from pathlib import Path
 from urllib.parse import urlparse
 import xml.etree.ElementTree as ET
 
@@ -18,6 +19,10 @@ DRY_RUN = os.getenv("DRY_RUN", "true").lower() == "true"
 FB_PAGE_ID = os.getenv("FACEBOOK_PAGE_ID", "").strip()
 FB_PAGE_TOKEN = os.getenv("FACEBOOK_PAGE_ACCESS_TOKEN", "").strip()
 FB_USER_TOKEN = os.getenv("FB_USER_ACCESS_TOKEN", "").strip()
+FB_APP_ID = os.getenv("FACEBOOK_APP_ID", "").strip()
+FB_APP_SECRET = os.getenv("FACEBOOK_APP_SECRET", "").strip()
+TOKEN_CACHE_FILE = Path(os.getenv("FACEBOOK_TOKEN_CACHE_FILE", "facebook_token_cache.json"))
+TOKEN_REFRESH_BUFFER_SECONDS = 7 * 24 * 60 * 60
 
 GRAPH_VERSION = os.getenv("META_GRAPH_API_VERSION", "v26.0")
 GRAPH_BASE = f"https://graph.facebook.com/{GRAPH_VERSION}"
@@ -82,44 +87,132 @@ def api_error(response):
         return f"HTTP {response.status_code}: {response.text[:300]}"
 
 
+def load_token_cache():
+    """Load locally cached long-lived credentials, if available."""
+    try:
+        with TOKEN_CACHE_FILE.open("r", encoding="utf-8") as f:
+            data = json.load(f)
+            return data if isinstance(data, dict) else {}
+    except (FileNotFoundError, json.JSONDecodeError, OSError):
+        return {}
+
+
+def save_token_cache(data):
+    """Save tokens locally and restrict file permissions where supported."""
+    TOKEN_CACHE_FILE.parent.mkdir(parents=True, exist_ok=True)
+    with TOKEN_CACHE_FILE.open("w", encoding="utf-8") as f:
+        json.dump(data, f, ensure_ascii=False, indent=2)
+    try:
+        os.chmod(TOKEN_CACHE_FILE, 0o600)
+    except OSError:
+        # Some platforms (notably Windows) do not support POSIX permissions.
+        pass
+
+
+def exchange_for_long_lived_user_token(short_lived_token):
+    """Exchange a user token for a long-lived user token using the app secret."""
+    if not FB_APP_ID or not FB_APP_SECRET:
+        raise RuntimeError(
+            "Automatic long-lived token exchange requires FACEBOOK_APP_ID "
+            "and FACEBOOK_APP_SECRET."
+        )
+
+    response = session.get(
+        f"{GRAPH_BASE}/oauth/access_token",
+        params={
+            "grant_type": "fb_exchange_token",
+            "client_id": FB_APP_ID,
+            "client_secret": FB_APP_SECRET,
+            "fb_exchange_token": short_lived_token,
+        },
+        timeout=TIMEOUT,
+    )
+    if not response.ok:
+        raise RuntimeError(f"Long-lived token exchange failed: {api_error(response)}")
+
+    result = response.json()
+    token = result.get("access_token")
+    if not token:
+        raise RuntimeError("Meta did not return an access_token during exchange.")
+
+    expires_in = int(result.get("expires_in", 0) or 0)
+    expires_at = int(datetime.now(timezone.utc).timestamp()) + expires_in if expires_in else None
+    return token, expires_at
+
+
+def get_long_lived_user_token(cache):
+    """Use a valid cached token, or exchange the supplied short-lived token."""
+    now = int(datetime.now(timezone.utc).timestamp())
+    cached_token = cache.get("user_access_token", "")
+    cached_expiry = cache.get("user_expires_at")
+
+    if cached_token and (not cached_expiry or cached_expiry - now > TOKEN_REFRESH_BUFFER_SECONDS):
+        return cached_token, cached_expiry
+
+    if not FB_USER_TOKEN:
+        if cached_token and cached_expiry:
+            raise RuntimeError(
+                "The cached long-lived User Access Token is expired or expires "
+                "within 7 days. Provide a fresh FB_USER_ACCESS_TOKEN to exchange "
+                "again. Meta does not provide a guaranteed unattended refresh "
+                "for every user token."
+            )
+        raise RuntimeError(
+            "For automatic long-lived token setup, provide FB_USER_ACCESS_TOKEN "
+            "(a valid short-lived User Access Token), FACEBOOK_APP_ID, and "
+            "FACEBOOK_APP_SECRET."
+        )
+
+    token, expires_at = exchange_for_long_lived_user_token(FB_USER_TOKEN)
+    cache["user_access_token"] = token
+    cache["user_expires_at"] = expires_at
+    save_token_cache(cache)
+    print("Exchanged the supplied User Access Token for a long-lived token.")
+    return token, expires_at
+
+
 def get_page_access_token():
     if not FB_PAGE_ID:
         raise RuntimeError("FACEBOOK_PAGE_ID secret is missing.")
 
-    # Prefer configured Page token.
+    # An explicitly configured Page token takes precedence.
     if FB_PAGE_TOKEN:
         return FB_PAGE_TOKEN
 
-    # Optional fallback: obtain Page token from User token.
-    if not FB_USER_TOKEN:
-        raise RuntimeError(
-            "Set FACEBOOK_PAGE_ACCESS_TOKEN or FB_USER_ACCESS_TOKEN."
-        )
+    cache = load_token_cache()
+    user_token, _ = get_long_lived_user_token(cache)
 
+    # Fetch the Page token from the account associated with the long-lived user token.
     url = f"{GRAPH_BASE}/me/accounts"
     params = {
         "fields": "id,name,access_token",
         "limit": 100,
-        "access_token": FB_USER_TOKEN,
+        "access_token": user_token,
     }
 
     while url:
         response = session.get(url, params=params, timeout=TIMEOUT)
         if not response.ok:
-            raise RuntimeError(
-                f"Could not get Page token: {api_error(response)}"
-            )
+            raise RuntimeError(f"Could not get Page token: {api_error(response)}")
 
         data = response.json()
         for page in data.get("data", []):
             if str(page.get("id")) == FB_PAGE_ID and page.get("access_token"):
-                return page["access_token"]
+                page_token = page["access_token"]
+                cache["page_id"] = FB_PAGE_ID
+                cache["page_access_token"] = page_token
+                cache["page_name"] = page.get("name", "")
+                save_token_cache(cache)
+                print(f"Retrieved and cached Page Access Token for: {page.get('name', FB_PAGE_ID)}")
+                return page_token
 
         url = data.get("paging", {}).get("next")
         params = None
 
     raise RuntimeError(
-        "Target Page not found in /me/accounts. Check Page access and token."
+        "Target Page not found in /me/accounts. Confirm that the user has access "
+        "to the Page and that the token includes pages_show_list and the required "
+        "Page permissions."
     )
 
 
